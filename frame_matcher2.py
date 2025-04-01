@@ -249,4 +249,4 @@ if __name__ == "__main__":
 #     "matched_frames_output"  # Directory to save matched frame pairs
 # )
 
-# python video_frame_matching.py --video1 path/to/video1.mp4 --video2 path/to/video2.mp4 --sample_rate 5 --num_matches 10 --output matches.png
+# python video_frame_matching.py --video1 match_results/match_Dw9cBXaT0ao_vs_KJkPMbhlMnU_at_030944670/KJkPMbhlMnU_full.mp4 --video2 match_results/match_Dw9cBXaT0ao_vs_KJkPMbhlMnU_at_030944670/Dw9cBXaT0ao_segment_030944670.mp4 --sample_rate 1 --num_matches 10 --output matches.png
