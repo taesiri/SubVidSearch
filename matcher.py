@@ -1,8 +1,10 @@
 import re
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer, util
 import os  # Added for file existence check
+import pickle  # Added
+import time  # Added for timing cache operations
+from pathlib import Path  # Added
 
 # Load the model once when the module is imported
 # This avoids reloading the model every time a match is performed
@@ -10,33 +12,63 @@ print("Loading sentence transformer model...")
 MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 print("Model loaded.")
 
+# --- Constants ---
+MODEL_NAME = "all-MiniLM-L6-v2"
+# Consider making BATCH_SIZE configurable or adjusting based on available memory
+BATCH_SIZE = 64
+# Minimum similarity score to consider a match valid (adjust as needed)
+MIN_SIMILARITY_THRESHOLD = 0.65  # Example threshold
+
+# --- Helper Functions ---
+
+
+def _parse_timestamp(ts_str):
+    """Helper to parse VTT timestamp string (HH:MM:SS.ms)"""
+    # Basic parsing, can be made more robust if needed
+    try:
+        h, m, s_ms = ts_str.split(":")
+        s, ms = s_ms.split(".")
+        return int(h), int(m), int(s), int(ms)
+    except ValueError:
+        # Handle cases like '0:00:01.123' if they occur
+        parts = ts_str.split(":")
+        if len(parts) == 2:  # MM:SS.ms
+            m, s_ms = parts
+            h = 0
+            s, ms = s_ms.split(".")
+            return int(h), int(m), int(s), int(ms)
+        # Add more robust parsing if needed
+        print(f"Warning: Could not parse timestamp: {ts_str}")
+        return 0, 0, 0, 0
+
 
 def load_transcript_blocks_with_timestamps(vtt_filepath):
-    """Loads transcript text blocks with start and end timestamps from a VTT file."""
+    """
+    Loads transcript text blocks with start and end timestamps from a VTT file.
+    Returns a list of dictionaries: [{'start': str, 'end': str, 'text': str}].
+    """
     if not os.path.exists(vtt_filepath):
         print(f"Error: VTT file not found at {vtt_filepath}")
-        return []  # Return empty list if file doesn't exist
+        return []
 
     try:
         with open(vtt_filepath, "r", encoding="utf-8") as f:
             transcript_text = f.read()
     except Exception as e:
         print(f"Error reading VTT file {vtt_filepath}: {e}")
-        return []  # Return empty list on read error
+        return []
 
     blocks = []
     current_text = []
     current_start_time = None
     current_end_time = None
 
-    # Improved regex to handle potential variations and ignore WEBVTT header/styles
     lines = transcript_text.splitlines()
     i = 0
     while i < len(lines):
         line = lines[i].strip()
         i += 1
 
-        # Skip empty lines, WEBVTT header, STYLE, REGION etc.
         if (
             not line
             or line == "WEBVTT"
@@ -46,42 +78,44 @@ def load_transcript_blocks_with_timestamps(vtt_filepath):
         ):
             continue
 
-        # Look for timestamp lines
         time_match = re.match(
-            r"^(\d{2}:\d{2}:\d{2}\.\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}\.\d{3})", line
+            r"^(?:\d+:)?\d{2}:\d{2}\.\d{3}\s+-->\s+(?:\d+:)?\d{2}:\d{2}\.\d{3}", line
         )
         if time_match:
-            # If we have accumulated text from the previous block, save it
             if current_text and current_start_time is not None:
                 blocks.append(
-                    (current_start_time, current_end_time, " ".join(current_text))
+                    {
+                        "start": current_start_time,
+                        "end": current_end_time,
+                        "text": " ".join(current_text),
+                    }
                 )
-                current_text = []  # Reset for the new block
+                current_text = []
 
-            current_start_time = time_match.group(1)  # Store the start time
-            current_end_time = time_match.group(2)  # Store the end time
+            # Extract times directly from the matched line
+            parts = line.split(" --> ")
+            current_start_time = parts[0]
+            # Handle potential cue settings after end timestamp
+            current_end_time = parts[1].split(" ")[0]
 
-            # Read subsequent lines as text content until the next timestamp or empty line
             while i < len(lines) and lines[i].strip():
                 text_line = lines[i].strip()
-                # Ignore VTT cue settings like align:start position:15%
                 if not re.match(r"^[a-zA-Z]+:", text_line):
                     current_text.append(text_line)
                 i += 1
-            continue  # Move to the next line after processing text block
+            continue
 
-        # If it's not a timestamp line and we haven't found the first timestamp yet, skip
         if current_start_time is None:
             continue
 
-        # This part should ideally not be reached if parsing logic is correct,
-        # but handles potential stray text lines not associated with a timestamp block
-        # if line: # Append stray lines if needed, though VTT format usually groups them
-        #    current_text.append(line)
-
-    # Add the last block if any text was collected
     if current_text and current_start_time is not None:
-        blocks.append((current_start_time, current_end_time, " ".join(current_text)))
+        blocks.append(
+            {
+                "start": current_start_time,
+                "end": current_end_time,
+                "text": " ".join(current_text),
+            }
+        )
 
     if not blocks:
         print(f"Warning: No valid timestamped blocks found in {vtt_filepath}")
@@ -112,22 +146,139 @@ def average_cosine_similarity(clip_embeds, window_embeds):
         return 0.0
 
     # Calculate cosine similarity for corresponding blocks
-    similarity_matrix = cosine_similarity(clip_embeds, window_embeds)
+    similarity_matrix = util.cos_sim(clip_embeds, window_embeds).cpu().numpy()
     # Average the diagonal elements (similarity of clip_block_1 vs window_block_1, etc.)
     return similarity_matrix.diagonal().mean()
+
+
+def get_cache_path(subtitle_path):
+    """Generates the cache file path based on the subtitle file path."""
+    p = Path(subtitle_path)
+    return p.with_suffix(".pkl")
+
+
+def load_embeddings_from_cache(cache_path):
+    """Loads blocks (as list of dicts) and embeddings from a cache file."""
+    if not cache_path.exists():
+        return None
+    try:
+        print(f"[Matcher] Loading embeddings from cache: {cache_path.name}")
+        start_time = time.time()
+        with open(cache_path, "rb") as f:
+            data = pickle.load(f)
+        end_time = time.time()
+        print(f"[Matcher] Cache loaded in {end_time - start_time:.2f} seconds.")
+
+        # Validate format: tuple(list[dict], np.ndarray)
+        if (
+            isinstance(data, tuple)
+            and len(data) == 2
+            and isinstance(data[0], list)
+            and isinstance(data[1], np.ndarray)
+        ):
+            # Check if the first element (blocks) is a list of dicts with expected keys
+            if not data[0] or (
+                isinstance(data[0][0], dict)
+                and all(k in data[0][0] for k in ["start", "end", "text"])
+            ):
+                # Check if embedding dimensions match model output
+                # Note: This assumes MODEL is loaded and accessible here.
+                # If MODEL isn't guaranteed, this check might need adjustment.
+                if (
+                    data[1].shape[0] == len(data[0])
+                    and data[1].shape[1] == MODEL.get_sentence_embedding_dimension()
+                ):
+                    print("[Matcher] Cache format validated.")
+                    return data[0], data[1]  # Return blocks, embeddings
+                else:
+                    print(
+                        f"[Matcher] Warning: Cache file {cache_path.name} has embedding dimension mismatch or block count mismatch. Ignoring cache."
+                    )
+                    return None
+            else:
+                print(
+                    f"[Matcher] Warning: Cache file {cache_path.name} has unexpected block structure (expected list of dicts). Ignoring cache."
+                )
+                return None
+        else:
+            print(
+                f"[Matcher] Warning: Cache file {cache_path.name} has unexpected format (expected tuple(list, ndarray)). Ignoring cache."
+            )
+            return None
+    except (
+        pickle.UnpicklingError,
+        EOFError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        ModuleNotFoundError,
+        ImportError,
+    ) as e:  # Added ModuleNotFoundError/ImportError for custom classes if used later
+        print(
+            f"[Matcher] Error loading cache file {cache_path.name}: {e}. Recomputing embeddings."
+        )
+        # Optionally delete the corrupted cache file: cache_path.unlink(missing_ok=True)
+        return None
+    except Exception as e:
+        print(
+            f"[Matcher] An unexpected error occurred loading cache {cache_path.name}: {e}"
+        )
+        return None
+
+
+def save_embeddings_to_cache(cache_path, blocks, embeddings):
+    """Saves blocks (list of dicts) and embeddings to a cache file."""
+    try:
+        print(f"[Matcher] Attempting to save embeddings to cache: {cache_path}")
+        start_time = time.time()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure blocks are in the expected dict format before saving
+        if not blocks or not isinstance(blocks[0], dict):
+            print(
+                "[Matcher] Error: Attempting to save blocks in incorrect format. Aborting cache save."
+            )
+            return
+
+        print(f"[Matcher] Cache directory exists: {cache_path.parent.exists()}")
+        print(
+            f"[Matcher] Saving {len(blocks)} blocks and embeddings shape {embeddings.shape}..."
+        )
+
+        with open(cache_path, "wb") as f:
+            print("[Matcher] Opened cache file for writing...")
+            pickle.dump(
+                (blocks, embeddings), f
+            )  # Save as tuple (list[dict], np.ndarray)
+            print("[Matcher] pickle.dump completed.")
+
+        end_time = time.time()
+        # Check if file exists immediately after saving
+        if cache_path.exists():
+            print(f"[Matcher] Cache file successfully created: {cache_path}")
+            print(f"[Matcher] Cache saved in {end_time - start_time:.2f} seconds.")
+        else:
+            print(
+                f"[Matcher] *** Error: Cache file NOT found after saving attempt: {cache_path} ***"
+            )
+
+    except Exception as e:
+        # Print the specific exception
+        print(f"[Matcher] *** Error saving cache file {cache_path}: {e} ***")
+        import traceback
+
+        traceback.print_exc()
 
 
 def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
     """
     Finds the best matching segment of the full transcript for the clip transcript.
+    Utilizes caching for the full video's embeddings.
 
     Args:
         full_vtt_path (str): Path to the VTT file of the long video.
         clip_vtt_path (str): Path to the VTT file of the short clip.
         window_size_factor (float): Multiplies the clip length to determine
                                     the search window size in the full transcript.
-                                    1.0 means the window size is exactly the clip length.
-                                    Can be adjusted slightly > 1.0 if needed.
 
     Returns:
         tuple: (start_timestamp, end_timestamp, similarity_score, start_index, matched_preview_text)
@@ -137,17 +288,61 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
         f"\nMatching '{os.path.basename(clip_vtt_path)}' against '{os.path.basename(full_vtt_path)}'..."
     )
 
-    full_blocks = load_transcript_blocks_with_timestamps(full_vtt_path)
+    # --- Handle Full Transcript: Load from Cache or Compute ---
+    full_blocks = None
+    full_embeds = None
+    full_cache_path = get_cache_path(full_vtt_path)
+    print(f"[Matcher] Cache path determined for full VTT: {full_cache_path}")
+
+    cached_data = load_embeddings_from_cache(full_cache_path)
+    if cached_data:
+        full_blocks, full_embeds = cached_data
+        print(
+            f"[Matcher] Using cached embeddings for {os.path.basename(full_vtt_path)}"
+        )
+    else:
+        print(
+            f"[Matcher] No valid cache found for {os.path.basename(full_vtt_path)}. Processing VTT..."
+        )
+        full_blocks = load_transcript_blocks_with_timestamps(full_vtt_path)
+        if full_blocks:
+            full_texts = [block["text"] for block in full_blocks]
+            if full_texts:
+                print(f"Embedding {len(full_texts)} full blocks...")
+                full_embeds = embed_blocks(full_texts, MODEL)
+                # Save to cache if embeddings were successful
+                if full_embeds.shape[0] > 0:
+                    save_embeddings_to_cache(full_cache_path, full_blocks, full_embeds)
+            else:
+                print("[Matcher] No text found in full transcript blocks.")
+                full_embeds = np.array([])  # Ensure embeds is an empty array
+        else:
+            print("[Matcher] Failed to load blocks from full transcript VTT.")
+            full_embeds = np.array([])  # Ensure embeds is an empty array
+
+    # --- Handle Clip Transcript: Load and Embed (No Caching for Clip) ---
     clip_blocks = load_transcript_blocks_with_timestamps(clip_vtt_path)
 
-    if not full_blocks or not clip_blocks:
-        print("Matching failed: Could not load transcript blocks.")
+    # --- Validation and Setup ---
+    if (
+        full_blocks is None
+        or not clip_blocks
+        or full_embeds is None
+        or full_embeds.shape[0] == 0
+    ):
+        print(
+            "Matching failed: Could not load or embed transcript blocks for full video or clip."
+        )
         return None, None, 0, -1, ""
 
     clip_len = len(clip_blocks)
-    full_len = len(full_blocks)
+    full_len = len(full_blocks)  # Use length of loaded blocks
+
+    if clip_len == 0:
+        print("Matching failed: Clip transcript has no blocks.")
+        return None, None, 0, -1, ""
+
     window_size = int(clip_len * window_size_factor)
-    # Ensure window size isn't larger than the full transcript or smaller than the clip
     window_size = max(clip_len, min(window_size, full_len))
 
     if clip_len > full_len:
@@ -155,78 +350,62 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
             "Warning: Clip transcript is longer than the full transcript. Cannot match."
         )
         return None, None, 0, -1, ""
-    if window_size > full_len:
-        print(
-            f"Adjusted window size ({window_size}) is larger than full transcript length ({full_len}). Setting window size to clip length ({clip_len})."
-        )
-        window_size = (
-            clip_len  # Fallback to exact clip length if factor makes it too large
-        )
+    # Window size adjustment warning already handled by min(window_size, full_len)
 
-    full_texts = [text for _, _, text in full_blocks]
-    clip_texts = [text for _, _, text in clip_blocks]
-
-    # Only embed if texts are available
-    if not clip_texts or not full_texts:
-        print("Matching failed: No text found in blocks.")
+    clip_texts = [block["text"] for block in clip_blocks]
+    if not clip_texts:
+        print("Matching failed: No text found in clip blocks.")
         return None, None, 0, -1, ""
 
-    print(
-        f"Embedding {len(clip_texts)} clip blocks and {len(full_texts)} full blocks..."
-    )
+    print(f"Embedding {len(clip_texts)} clip blocks...")
     clip_embeds = embed_blocks(clip_texts, MODEL)
-    full_embeds = embed_blocks(full_texts, MODEL)
 
-    if clip_embeds.shape[0] == 0 or full_embeds.shape[0] == 0:
-        print("Matching failed: Could not generate embeddings.")
+    if clip_embeds.shape[0] == 0:
+        print("Matching failed: Could not generate clip embeddings.")
         return None, None, 0, -1, ""
 
+    # --- Perform Matching ---
     best_index = -1
-    best_score = -1.0  # Initialize with a value lower than possible cosine similarity
+    best_score = -1.0
 
     print(
         f"Performing sliding window match (window size: {window_size}, clip length: {clip_len})..."
     )
-    # Iterate through the full transcript embeddings with the sliding window
-    # The loop should go up to full_len - window_size + 1
-    for i in range(full_len - window_size + 1):
+    # Ensure loop range is correct even if window_size adjusted to full_len
+    for i in range(
+        full_len - clip_len + 1
+    ):  # Iterate up to the last possible start for the clip
         # Extract the window embeddings from the full transcript
-        window_embeds = full_embeds[i : i + window_size]
+        # We only need the segment corresponding to the clip length for direct comparison
+        window_segment_embeds = full_embeds[i : i + clip_len]
 
-        # We need to compare the *clip* embeddings against the *window* embeddings.
-        # If window_size is exactly clip_len, we compare directly.
-        # If window_size > clip_len (due to factor), we might need a strategy:
-        #   Option A: Compare clip_embeds against the first clip_len embeds in the window.
-        #   Option B: Calculate similarity differently (e.g., max similarity within window).
-        # Let's stick to Option A for simplicity, assuming window_size is primarily for context
-        # and the core match is based on the clip's length.
-        current_window_segment_embeds = window_embeds[
-            :clip_len
-        ]  # Take the part matching clip length
-
-        # Calculate average cosine similarity between the clip and the current window segment
-        score = average_cosine_similarity(clip_embeds, current_window_segment_embeds)
+        # Calculate average cosine similarity
+        score = average_cosine_similarity(clip_embeds, window_segment_embeds)
 
         if score > best_score:
             best_score = score
-            best_index = i  # The start index of the best matching window
+            best_index = i
 
-    if best_index != -1:
-        # Get start time of the first matched block
-        start_timestamp, _, _ = full_blocks[best_index]
-        # Get end time of the last matched block
-        # Ensure the index doesn't go out of bounds
+    # --- Process Results ---
+    if (
+        best_index != -1 and best_score >= MIN_SIMILARITY_THRESHOLD
+    ):  # Added threshold check
+        # Get timestamps and text from the block dictionaries
+        start_timestamp = full_blocks[best_index]["start"]
+        # Ensure the end index doesn't go out of bounds
         end_block_index = min(best_index + clip_len - 1, full_len - 1)
-        _, end_timestamp, _ = full_blocks[end_block_index]
+        end_timestamp = full_blocks[end_block_index]["end"]
 
-        # Preview text should correspond to the actual matched segment length (clip_len)
         match_preview = " ".join(
-            # Extract text from the third element
-            text
-            for _, _, text in full_blocks[best_index : best_index + clip_len]
+            block["text"] for block in full_blocks[best_index : best_index + clip_len]
         )
         print(f"Match found: Index {best_index}, Score {best_score:.4f}")
         return start_timestamp, end_timestamp, best_score, best_index, match_preview
+    elif best_index != -1:
+        print(
+            f"Potential match found (Index {best_index}, Score {best_score:.4f}) but below threshold ({MIN_SIMILARITY_THRESHOLD})."
+        )
+        return None, None, 0, -1, ""
     else:
         print("No suitable match found.")
         return None, None, 0, -1, ""
