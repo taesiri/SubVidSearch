@@ -10,7 +10,15 @@ from datetime import datetime
 SUBTITLES_DIR = "subtitles"
 LONG_VIDEO_URL = "https://www.youtube.com/watch?v=Dw9cBXaT0ao"  # Example Long Video
 SHORT_VIDEOS_URLS = [
-    "https://www.youtube.com/watch?v=KJkPMbhlMnU",  # Example Short Clip 1
+    "https://www.youtube.com/watch?v=KJkPMbhlMnU",
+    "https://www.youtube.com/watch?v=FnT9wl10VDo",
+    "https://www.youtube.com/watch?v=sX1j_v1doK4",
+    "https://www.youtube.com/watch?v=EpPo8bS-S10",
+    "https://www.youtube.com/watch?v=iEXlUG3JmFs",
+    "https://www.youtube.com/watch?v=q5QP3zOzTzE",
+    "https://www.youtube.com/watch?v=c8Nf2S12QlI",
+    "https://www.youtube.com/watch?v=yzsZ4A6r18c",
+    "https://www.youtube.com/watch?v=Brp5iwZoCoc",
 ]
 RESULTS_DIR = "match_results"  # Directory to save downloaded clips/segments
 # --- End Configuration ---

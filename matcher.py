@@ -127,28 +127,42 @@ def embed_blocks(text_blocks, model):
     """Generates embeddings for a list of text blocks."""
     if not text_blocks:
         return np.array([])
-    embeddings = model.encode(text_blocks, convert_to_tensor=True)
-    return embeddings.cpu().numpy()
+    # Use batch processing for potentially large inputs
+    all_embeddings = model.encode(
+        text_blocks,
+        batch_size=BATCH_SIZE,  # Use the constant
+        convert_to_tensor=True,
+        show_progress_bar=False,  # Set to True for debugging long embeddings
+    )
+    return all_embeddings.cpu().numpy()
 
 
-def average_cosine_similarity(clip_embeds, window_embeds):
-    """Calculates the average diagonal cosine similarity between two sets of embeddings."""
-    # Ensure embeddings are not empty and shapes match for diagonal calculation
+def calculate_robust_similarity(clip_embeds, window_embeds):
+    """
+    Calculates similarity robustly, accounting for potential block misalignment.
+
+    For each clip embedding, it finds the maximum similarity against all
+    window embeddings and averages these maximums.
+    """
     if clip_embeds.shape[0] == 0 or window_embeds.shape[0] == 0:
         return 0.0
-    if clip_embeds.shape[0] != window_embeds.shape[0]:
-        # This shouldn't happen with the sliding window logic, but good to check
-        print(
-            f"Warning: Shape mismatch for cosine similarity ({clip_embeds.shape[0]} vs {window_embeds.shape[0]})"
-        )
-        # Fallback: Calculate full similarity matrix and average? Or return 0?
-        # For sliding window, a mismatch indicates an issue elsewhere. Let's return 0.
-        return 0.0
 
-    # Calculate cosine similarity for corresponding blocks
+    # Calculate the full cosine similarity matrix: (num_clip_blocks x num_window_blocks)
     similarity_matrix = util.cos_sim(clip_embeds, window_embeds).cpu().numpy()
-    # Average the diagonal elements (similarity of clip_block_1 vs window_block_1, etc.)
-    return similarity_matrix.diagonal().mean()
+
+    # For each clip block (row), find the highest similarity score in that row
+    # This finds the best matching window block for each clip block
+    max_sim_per_clip_block = np.max(similarity_matrix, axis=1)
+
+    # Average these maximum scores
+    # This gives an overall score indicating how well the clip blocks are represented
+    # somewhere within the window blocks.
+    average_max_similarity = np.mean(max_sim_per_clip_block)
+
+    # Optional: Penalize if window is much larger than clip?
+    # Could add a length penalty, but let's start simple.
+
+    return average_max_similarity
 
 
 def get_cache_path(subtitle_path):
@@ -272,13 +286,15 @@ def save_embeddings_to_cache(cache_path, blocks, embeddings):
 def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
     """
     Finds the best matching segment of the full transcript for the clip transcript.
-    Utilizes caching for the full video's embeddings.
+    Utilizes caching for the full video's embeddings and a robust similarity metric.
 
     Args:
         full_vtt_path (str): Path to the VTT file of the long video.
         clip_vtt_path (str): Path to the VTT file of the short clip.
         window_size_factor (float): Multiplies the clip length to determine
                                     the search window size in the full transcript.
+                                    *Note: With robust similarity, this factor is less critical,
+                                    but kept for potential future use or different strategies.*
 
     Returns:
         tuple: (start_timestamp, end_timestamp, similarity_score, start_index, matched_preview_text)
@@ -305,60 +321,73 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
             f"[Matcher] No valid cache found for {os.path.basename(full_vtt_path)}. Processing VTT..."
         )
         full_blocks = load_transcript_blocks_with_timestamps(full_vtt_path)
-        if full_blocks:
-            full_texts = [block["text"] for block in full_blocks]
-            if full_texts:
-                print(f"Embedding {len(full_texts)} full blocks...")
-                full_embeds = embed_blocks(full_texts, MODEL)
-                # Save to cache if embeddings were successful
-                if full_embeds.shape[0] > 0:
-                    save_embeddings_to_cache(full_cache_path, full_blocks, full_embeds)
-            else:
-                print("[Matcher] No text found in full transcript blocks.")
-                full_embeds = np.array([])  # Ensure embeds is an empty array
+        if not full_blocks:
+            print(
+                "[Matcher] Failed to load blocks from full transcript VTT. Aborting match."
+            )
+            return None, None, 0, -1, ""  # Early exit if full VTT fails
+
+        full_texts = [
+            block["text"] for block in full_blocks if block["text"].strip()
+        ]  # Ensure non-empty text
+        if full_texts:
+            print(f"Embedding {len(full_texts)} non-empty full blocks...")
+            start_embed_time = time.time()
+            full_embeds = embed_blocks(full_texts, MODEL)
+            end_embed_time = time.time()
+            print(
+                f"Full embedding took {end_embed_time - start_embed_time:.2f} seconds."
+            )
+            # Filter full_blocks to only include those that were actually embedded
+            full_blocks = [block for block in full_blocks if block["text"].strip()]
+            # Save to cache if embeddings were successful
+            if full_embeds.shape[0] > 0:
+                save_embeddings_to_cache(full_cache_path, full_blocks, full_embeds)
         else:
-            print("[Matcher] Failed to load blocks from full transcript VTT.")
-            full_embeds = np.array([])  # Ensure embeds is an empty array
+            print(
+                "[Matcher] No non-empty text found in full transcript blocks. Aborting match."
+            )
+            return None, None, 0, -1, ""  # Early exit
 
     # --- Handle Clip Transcript: Load and Embed (No Caching for Clip) ---
-    clip_blocks = load_transcript_blocks_with_timestamps(clip_vtt_path)
+    clip_blocks_raw = load_transcript_blocks_with_timestamps(clip_vtt_path)
+    if not clip_blocks_raw:
+        print("Matching failed: Could not load clip transcript blocks.")
+        return None, None, 0, -1, ""
+
+    # Filter clip blocks for non-empty text BEFORE embedding
+    clip_blocks = [block for block in clip_blocks_raw if block["text"].strip()]
+    clip_texts = [block["text"] for block in clip_blocks]
 
     # --- Validation and Setup ---
-    if (
-        full_blocks is None
-        or not clip_blocks
-        or full_embeds is None
-        or full_embeds.shape[0] == 0
-    ):
-        print(
-            "Matching failed: Could not load or embed transcript blocks for full video or clip."
-        )
+    if not clip_blocks or not clip_texts:
+        print("Matching failed: Clip transcript has no non-empty blocks.")
         return None, None, 0, -1, ""
 
-    clip_len = len(clip_blocks)
-    full_len = len(full_blocks)  # Use length of loaded blocks
-
-    if clip_len == 0:
-        print("Matching failed: Clip transcript has no blocks.")
+    if full_embeds is None or full_embeds.shape[0] == 0:
+        print("Matching failed: Full transcript embeddings are missing or empty.")
         return None, None, 0, -1, ""
 
-    window_size = int(clip_len * window_size_factor)
-    window_size = max(clip_len, min(window_size, full_len))
+    clip_len = len(clip_blocks)  # Length of non-empty blocks
+    full_len = len(full_blocks)  # Length of non-empty blocks
+
+    # Adjust window_size based on clip length (number of blocks)
+    # window_size = int(clip_len * window_size_factor) # This factor might be less relevant now
+    # window_size = max(clip_len, min(window_size, full_len)) # Ensure window is at least clip size and not > full size
+    # For robust matching, the window we slide should exactly match the clip length
+    window_size = clip_len
 
     if clip_len > full_len:
         print(
-            "Warning: Clip transcript is longer than the full transcript. Cannot match."
+            f"Warning: Clip transcript ({clip_len} blocks) is longer than the full transcript ({full_len} blocks). Cannot match."
         )
         return None, None, 0, -1, ""
-    # Window size adjustment warning already handled by min(window_size, full_len)
 
-    clip_texts = [block["text"] for block in clip_blocks]
-    if not clip_texts:
-        print("Matching failed: No text found in clip blocks.")
-        return None, None, 0, -1, ""
-
-    print(f"Embedding {len(clip_texts)} clip blocks...")
+    print(f"Embedding {len(clip_texts)} non-empty clip blocks...")
+    start_embed_time = time.time()
     clip_embeds = embed_blocks(clip_texts, MODEL)
+    end_embed_time = time.time()
+    print(f"Clip embedding took {end_embed_time - start_embed_time:.2f} seconds.")
 
     if clip_embeds.shape[0] == 0:
         print("Matching failed: Could not generate clip embeddings.")
@@ -368,34 +397,41 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
     best_index = -1
     best_score = -1.0
 
-    print(
-        f"Performing sliding window match (window size: {window_size}, clip length: {clip_len})..."
-    )
-    # Ensure loop range is correct even if window_size adjusted to full_len
-    for i in range(
-        full_len - clip_len + 1
-    ):  # Iterate up to the last possible start for the clip
+    print(f"Performing sliding window match (Clip length: {clip_len} blocks)...")
+    match_start_time = time.time()
+    # Iterate through all possible starting positions for the clip in the full transcript
+    for i in range(full_len - clip_len + 1):
         # Extract the window embeddings from the full transcript
-        # We only need the segment corresponding to the clip length for direct comparison
+        # The window size now directly corresponds to the clip length
         window_segment_embeds = full_embeds[i : i + clip_len]
 
-        # Calculate average cosine similarity
-        score = average_cosine_similarity(clip_embeds, window_segment_embeds)
+        # Calculate similarity using the robust method
+        score = calculate_robust_similarity(clip_embeds, window_segment_embeds)
 
         if score > best_score:
             best_score = score
             best_index = i
 
+            # Optional: Add a small bonus for sequential matches?
+            # Could calculate diagonal similarity as well and add a fraction if it's high?
+            # diag_score = _average_diagonal_similarity(clip_embeds, window_segment_embeds)
+            # bonus = max(0, diag_score - 0.5) * 0.1 # Example bonus
+            # score += bonus
+
+    match_end_time = time.time()
+    print(
+        f"Sliding window comparison took {match_end_time - match_start_time:.2f} seconds."
+    )
+
     # --- Process Results ---
-    if (
-        best_index != -1 and best_score >= MIN_SIMILARITY_THRESHOLD
-    ):  # Added threshold check
-        # Get timestamps and text from the block dictionaries
+    if best_index != -1 and best_score >= MIN_SIMILARITY_THRESHOLD:
+        # Get timestamps and text from the original block dictionaries
         start_timestamp = full_blocks[best_index]["start"]
         # Ensure the end index doesn't go out of bounds
         end_block_index = min(best_index + clip_len - 1, full_len - 1)
         end_timestamp = full_blocks[end_block_index]["end"]
 
+        # Preview text uses the blocks from the best matching window
         match_preview = " ".join(
             block["text"] for block in full_blocks[best_index : best_index + clip_len]
         )
@@ -405,7 +441,99 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
         print(
             f"Potential match found (Index {best_index}, Score {best_score:.4f}) but below threshold ({MIN_SIMILARITY_THRESHOLD})."
         )
-        return None, None, 0, -1, ""
+        # Optionally return the low-confidence match if needed for debugging/review
+        # start_timestamp = full_blocks[best_index]["start"]
+        # end_block_index = min(best_index + clip_len - 1, full_len - 1)
+        # end_timestamp = full_blocks[end_block_index]["end"]
+        # match_preview = " ".join(block["text"] for block in full_blocks[best_index:best_index + clip_len])
+        # return start_timestamp, end_timestamp, best_score, best_index, match_preview # Return low score match
+        return None, None, 0, -1, ""  # Or return failure as before
     else:
-        print("No suitable match found.")
+        # This case should ideally not happen if full_len >= clip_len > 0
+        print("No suitable match found (best_index remained -1).")
         return None, None, 0, -1, ""
+
+
+def find_best_match_concatenated(full_vtt_path, clip_vtt_path):
+    """
+    Finds the best matching segment by concatenating text within windows.
+    Simpler but less precise than block-based robust matching.
+    """
+    print(
+        f"\nMatching (Concatenated) '{os.path.basename(clip_vtt_path)}' against '{os.path.basename(full_vtt_path)}'..."
+    )
+
+    # --- Load Full Transcript (Cache or Compute Blocks) ---
+    # ... (Same loading/caching logic as Strategy 1 to get full_blocks)
+    # ... (Make sure to handle errors and empty blocks as in Strategy 1)
+    # We don't need full_embeds here, just full_blocks
+
+    # --- Load Clip Transcript ---
+    clip_blocks_raw = load_transcript_blocks_with_timestamps(clip_vtt_path)
+    if not clip_blocks_raw:
+        print("Matching failed: Could not load clip transcript blocks.")
+        return None, None, 0, -1, ""
+    clip_blocks = [block for block in clip_blocks_raw if block["text"].strip()]
+    if not clip_blocks:
+        print("Matching failed: Clip transcript has no non-empty blocks.")
+        return None, None, 0, -1, ""
+
+    clip_len = len(clip_blocks)
+    full_len = len(full_blocks)
+
+    if clip_len > full_len:
+        print("Warning: Clip transcript is longer than the full transcript.")
+        return None, None, 0, -1, ""
+
+    # --- Concatenate and Embed Clip Text ---
+    clip_full_text = " ".join([block["text"] for block in clip_blocks])
+    print("Embedding concatenated clip text...")
+    clip_embed = embed_blocks([clip_full_text], MODEL)  # Embed as a single item list
+    if clip_embed.shape[0] == 0:
+        print("Matching failed: Could not generate concatenated clip embedding.")
+        return None, None, 0, -1, ""
+
+    # --- Perform Matching ---
+    best_index = -1
+    best_score = -1.0
+
+    print(
+        f"Performing sliding window match (Concatenated, Clip length: {clip_len} blocks)..."
+    )
+    match_start_time = time.time()
+
+    # Pre-embed all full blocks if not cached (or maybe embed windows on the fly?)
+    # For efficiency, let's pre-embed all full blocks if not using cache for them
+    # This part needs careful thought for performance if full transcript is huge and not cached.
+    # Assuming full_embeds were generated/loaded as in Strategy 1 for this example.
+    # If not, embedding each window text repeatedly would be very slow.
+    # A better way for this strategy might be to *not* cache block embeddings,
+    # but cache the concatenated text + embedding for windows if needed, which is complex.
+    # Let's proceed assuming we have full_blocks and can concatenate window text.
+
+    for i in range(full_len - clip_len + 1):
+        # Get the window of blocks
+        window_blocks = full_blocks[i : i + clip_len]
+        # Concatenate text in the window
+        window_full_text = " ".join([block["text"] for block in window_blocks])
+
+        # Embed the concatenated window text
+        window_embed = embed_blocks([window_full_text], MODEL)  # Embed as single item
+        if window_embed.shape[0] == 0:
+            continue  # Skip if embedding fails for this window
+
+        # Calculate similarity between the single clip embedding and single window embedding
+        score = util.cos_sim(clip_embed, window_embed).cpu().numpy()[0, 0]
+
+        if score > best_score:
+            best_score = score
+            best_index = i
+
+    match_end_time = time.time()
+    print(
+        f"Sliding window comparison took {match_end_time - match_start_time:.2f} seconds."
+    )
+
+    # --- Process Results ---
+    # ... (Same result processing as Strategy 1, using best_index and best_score)
+    # ...

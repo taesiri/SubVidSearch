@@ -52,6 +52,7 @@ def download_subtitle(url, subtitles_dir):
         "outtmpl": base_filepath,  # Output template (yt-dlp adds .lang.vtt or just .vtt)
         "quiet": True,
         "no_warnings": True,
+        "cookiesfrombrowser": ("firefox", None),  # Optional
     }
 
     print(f"Attempting to download subtitle for {video_id} ({url})...")
