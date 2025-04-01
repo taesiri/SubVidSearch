@@ -12,7 +12,7 @@ print("Model loaded.")
 
 
 def load_transcript_blocks_with_timestamps(vtt_filepath):
-    """Loads transcript text blocks with start timestamps from a VTT file."""
+    """Loads transcript text blocks with start and end timestamps from a VTT file."""
     if not os.path.exists(vtt_filepath):
         print(f"Error: VTT file not found at {vtt_filepath}")
         return []  # Return empty list if file doesn't exist
@@ -26,7 +26,8 @@ def load_transcript_blocks_with_timestamps(vtt_filepath):
 
     blocks = []
     current_text = []
-    current_time = None
+    current_start_time = None
+    current_end_time = None
 
     # Improved regex to handle potential variations and ignore WEBVTT header/styles
     lines = transcript_text.splitlines()
@@ -47,15 +48,18 @@ def load_transcript_blocks_with_timestamps(vtt_filepath):
 
         # Look for timestamp lines
         time_match = re.match(
-            r"^(\d{2}:\d{2}:\d{2}\.\d{3})\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}", line
+            r"^(\d{2}:\d{2}:\d{2}\.\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}\.\d{3})", line
         )
         if time_match:
             # If we have accumulated text from the previous block, save it
-            if current_text and current_time is not None:
-                blocks.append((current_time, " ".join(current_text)))
+            if current_text and current_start_time is not None:
+                blocks.append(
+                    (current_start_time, current_end_time, " ".join(current_text))
+                )
                 current_text = []  # Reset for the new block
 
-            current_time = time_match.group(1)  # Store the start time
+            current_start_time = time_match.group(1)  # Store the start time
+            current_end_time = time_match.group(2)  # Store the end time
 
             # Read subsequent lines as text content until the next timestamp or empty line
             while i < len(lines) and lines[i].strip():
@@ -67,7 +71,7 @@ def load_transcript_blocks_with_timestamps(vtt_filepath):
             continue  # Move to the next line after processing text block
 
         # If it's not a timestamp line and we haven't found the first timestamp yet, skip
-        if current_time is None:
+        if current_start_time is None:
             continue
 
         # This part should ideally not be reached if parsing logic is correct,
@@ -76,8 +80,8 @@ def load_transcript_blocks_with_timestamps(vtt_filepath):
         #    current_text.append(line)
 
     # Add the last block if any text was collected
-    if current_text and current_time is not None:
-        blocks.append((current_time, " ".join(current_text)))
+    if current_text and current_start_time is not None:
+        blocks.append((current_start_time, current_end_time, " ".join(current_text)))
 
     if not blocks:
         print(f"Warning: No valid timestamped blocks found in {vtt_filepath}")
@@ -126,8 +130,8 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
                                     Can be adjusted slightly > 1.0 if needed.
 
     Returns:
-        tuple: (start_timestamp, similarity_score, start_index, matched_preview_text)
-               Returns (None, 0, -1, "") if matching fails or inputs are invalid.
+        tuple: (start_timestamp, end_timestamp, similarity_score, start_index, matched_preview_text)
+               Returns (None, None, 0, -1, "") if matching fails or inputs are invalid.
     """
     print(
         f"\nMatching '{os.path.basename(clip_vtt_path)}' against '{os.path.basename(full_vtt_path)}'..."
@@ -138,7 +142,7 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
 
     if not full_blocks or not clip_blocks:
         print("Matching failed: Could not load transcript blocks.")
-        return None, 0, -1, ""
+        return None, None, 0, -1, ""
 
     clip_len = len(clip_blocks)
     full_len = len(full_blocks)
@@ -150,7 +154,7 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
         print(
             "Warning: Clip transcript is longer than the full transcript. Cannot match."
         )
-        return None, 0, -1, ""
+        return None, None, 0, -1, ""
     if window_size > full_len:
         print(
             f"Adjusted window size ({window_size}) is larger than full transcript length ({full_len}). Setting window size to clip length ({clip_len})."
@@ -159,13 +163,13 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
             clip_len  # Fallback to exact clip length if factor makes it too large
         )
 
-    full_texts = [text for _, text in full_blocks]
-    clip_texts = [text for _, text in clip_blocks]
+    full_texts = [text for _, _, text in full_blocks]
+    clip_texts = [text for _, _, text in clip_blocks]
 
     # Only embed if texts are available
     if not clip_texts or not full_texts:
         print("Matching failed: No text found in blocks.")
-        return None, 0, -1, ""
+        return None, None, 0, -1, ""
 
     print(
         f"Embedding {len(clip_texts)} clip blocks and {len(full_texts)} full blocks..."
@@ -175,7 +179,7 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
 
     if clip_embeds.shape[0] == 0 or full_embeds.shape[0] == 0:
         print("Matching failed: Could not generate embeddings.")
-        return None, 0, -1, ""
+        return None, None, 0, -1, ""
 
     best_index = -1
     best_score = -1.0  # Initialize with a value lower than possible cosine similarity
@@ -208,13 +212,21 @@ def find_best_match(full_vtt_path, clip_vtt_path, window_size_factor=1.0):
             best_index = i  # The start index of the best matching window
 
     if best_index != -1:
-        matched_timestamp, _ = full_blocks[best_index]
+        # Get start time of the first matched block
+        start_timestamp, _, _ = full_blocks[best_index]
+        # Get end time of the last matched block
+        # Ensure the index doesn't go out of bounds
+        end_block_index = min(best_index + clip_len - 1, full_len - 1)
+        _, end_timestamp, _ = full_blocks[end_block_index]
+
         # Preview text should correspond to the actual matched segment length (clip_len)
         match_preview = " ".join(
-            text for _, text in full_blocks[best_index : best_index + clip_len]
+            # Extract text from the third element
+            text
+            for _, _, text in full_blocks[best_index : best_index + clip_len]
         )
         print(f"Match found: Index {best_index}, Score {best_score:.4f}")
-        return matched_timestamp, best_score, best_index, match_preview
+        return start_timestamp, end_timestamp, best_score, best_index, match_preview
     else:
         print("No suitable match found.")
-        return None, 0, -1, ""
+        return None, None, 0, -1, ""

@@ -56,22 +56,27 @@ def run():
         clip_path = clip_info["path"]
         clip_url = clip_info["url"]
 
-        # Use the matcher module function
-        timestamp, score, index, preview = matcher.find_best_match(
+        # Use the matcher module function - unpack the new end_timestamp
+        start_timestamp, end_timestamp, score, index, preview = matcher.find_best_match(
             long_video_subtitle_path, clip_path
         )
 
-        if timestamp:
+        # Check if start_timestamp is not None (indicates a successful match)
+        if start_timestamp:
             print("\n✅ Match Found!")
             print(f"   Clip URL: {clip_url}")
-            print(f"   Matched Timestamp in Long Video: {timestamp}")
+            # Print the time range
+            print(
+                f"   Matched Time Range in Long Video: {start_timestamp} --> {end_timestamp}"
+            )
             print(f"   Similarity Score: {score:.4f}")
             print(f"   Start Block Index in Long Video: {index}")
             print(f'   Matched Text Preview:\n   """\n   {preview}\n   """')
             match_results.append(
                 {
                     "clip_url": clip_url,
-                    "timestamp": timestamp,
+                    "start_timestamp": start_timestamp,  # Store start
+                    "end_timestamp": end_timestamp,  # Store end
                     "score": score,
                     "index": index,
                 }
@@ -83,8 +88,9 @@ def run():
     if match_results:
         print("Summary of Matches Found:")
         for result in match_results:
+            # Update summary print
             print(
-                f"- Clip: {result['clip_url']} -> Timestamp: {result['timestamp']} (Score: {result['score']:.4f})"
+                f"- Clip: {result['clip_url']} -> Time Range: {result['start_timestamp']} --> {result['end_timestamp']} (Score: {result['score']:.4f})"
             )
     else:
         print("No matches were found for any of the short clips.")
